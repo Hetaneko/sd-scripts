@@ -463,10 +463,14 @@ class AnimaControlNetLLLiteWrapper(nn.Module):
         timesteps: torch.Tensor,
         context: torch.Tensor,
         cond_image: Optional[torch.Tensor] = None,
+        source_image: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # T=1 固定
         assert x.shape[2] == 1, f"Anima LLLite supports T=1 only, got T={x.shape[2]}"
+        # EDITING_COND: allow source_image alias for inference compatibility
+        if cond_image is None and source_image is not None:
+            cond_image = source_image
         if cond_image is not None:
             # 解像度整合チェック: x は VAE latent (/8)、cond_image は元画像 (/1)。
             # patchify (/2) は DiT 内部 (prepare_embedded_sequence) で実施されるため、

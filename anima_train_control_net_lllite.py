@@ -19,6 +19,9 @@ from PIL import Image
 from tqdm import tqdm
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoModel, AutoProcessor
 
 from library import flux_train_utils, qwen_image_autoencoder_kl
 from library.device_utils import init_ipex, clean_memory_on_device
@@ -118,6 +121,33 @@ def _make_lllite_sample_hooks(args, lllite, dit_dtype):
 
 
 def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
+    # EDITING_COND: switch for backward-compatible conditioning mode
+    parser.add_argument(
+        "--conditioning_type",
+        type=str,
+        default="spatial",
+        choices=["spatial", "image_text"],
+        help="conditioning mode: spatial(control map) or image_text(source image + instruction text)",
+    )
+    # EDITING_COND: SigLIP args for image_text mode
+    parser.add_argument(
+        "--siglip_model_name_or_path",
+        type=str,
+        default="google/siglip-base-patch16-224",
+        help="SigLIP vision model name/path used for source-image conditioning",
+    )
+    parser.add_argument("--siglip_trainable", action="store_true", help="train SigLIP vision encoder in image_text mode")
+    parser.add_argument(
+        "--source_image",
+        type=str,
+        default=None,
+        help="inference compatibility placeholder for source image path when using image_text conditioning",
+    )
+    parser.add_argument(
+        "--siglip_gradient_checkpointing",
+        action="store_true",
+        help="enable gradient checkpointing for SigLIP in image_text mode",
+    )
     parser.add_argument(
         "--cond_emb_dim",
         type=int,
@@ -374,6 +404,22 @@ def train(args):
 
     dit.requires_grad_(False)
 
+    # EDITING_COND: SigLIP encoder + projection for image_text conditioning
+    siglip_processor = None
+    siglip_vision_model = None
+    siglip_proj = None
+    if args.conditioning_type == "image_text":
+        logger.info(f"Loading SigLIP vision encoder: {args.siglip_model_name_or_path}")
+        siglip_processor = AutoProcessor.from_pretrained(args.siglip_model_name_or_path)
+        siglip_vision_model = AutoModel.from_pretrained(args.siglip_model_name_or_path).vision_model
+        if args.siglip_gradient_checkpointing:
+            siglip_vision_model.gradient_checkpointing_enable()
+        siglip_vision_model.requires_grad_(args.siglip_trainable)
+        if not args.siglip_trainable:
+            siglip_vision_model.eval()
+        context_dim = int(dit.blocks[0].cross_attn.context_dim)
+        siglip_proj = nn.Linear(siglip_vision_model.config.hidden_size, context_dim)
+
     # Build LLLite (DiT を走査して各 Attention Linear に貼る)
     logger.info("Building ControlNet-LLLite (Anima)...")
     lllite = ControlNetLLLiteDiT(
@@ -398,6 +444,11 @@ def train(args):
 
     # Optimizer
     trainable_params = list(lllite.parameters())
+    if args.conditioning_type == "image_text":
+        # EDITING_COND: train projection always, SigLIP optionally
+        trainable_params += list(siglip_proj.parameters())
+        if args.siglip_trainable:
+            trainable_params += [p for p in siglip_vision_model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable_params if p.requires_grad)
     accelerator.print(f"number of LLLite modules: {len(lllite.lllite_modules)}")
     accelerator.print(f"number of trainable parameters: {n_trainable:,}")
@@ -447,6 +498,9 @@ def train(args):
         lllite_dtype = weight_dtype
     lllite.to(lllite_dtype)
     lllite.to(accelerator.device)
+    if args.conditioning_type == "image_text":
+        siglip_proj.to(accelerator.device, dtype=lllite_dtype)
+        siglip_vision_model.to(accelerator.device, dtype=weight_dtype)
 
     if not args.cache_text_encoder_outputs and qwen3_text_encoder is not None:
         qwen3_text_encoder.to(accelerator.device)
@@ -458,9 +512,14 @@ def train(args):
     clean_memory_on_device(accelerator.device)
 
     # accelerator.prepare — wrapper を渡す
-    wrapper, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        wrapper, optimizer, train_dataloader, lr_scheduler
-    )
+    prepare_targets = [wrapper, optimizer, train_dataloader, lr_scheduler]
+    if args.conditioning_type == "image_text":
+        prepare_targets.extend([siglip_vision_model, siglip_proj])
+    prepared = accelerator.prepare(*prepare_targets)
+    if args.conditioning_type == "image_text":
+        wrapper, optimizer, train_dataloader, lr_scheduler, siglip_vision_model, siglip_proj = prepared
+    else:
+        wrapper, optimizer, train_dataloader, lr_scheduler = prepared
 
     if args.full_fp16:
         train_util.patch_accelerator_for_fp16_training(accelerator)
@@ -631,6 +690,21 @@ def train(args):
                 attn_mask = attn_mask.to(accelerator.device)
                 t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
                 t5_attn_mask = t5_attn_mask.to(accelerator.device)
+                # EDITING_COND: source image -> SigLIP -> projected vector -> fuse into prompt embeds
+                if args.conditioning_type == "image_text":
+                    source_image = batch["conditioning_images"].to(accelerator.device, dtype=dit_weight_dtype)
+                    siglip_in = F.interpolate((source_image + 1.0) / 2.0, size=(224, 224), mode="bilinear", align_corners=False)
+                    siglip_in = (siglip_in - 0.5) / 0.5
+                    with torch.set_grad_enabled(args.siglip_trainable):
+                        siglip_out = siglip_vision_model(pixel_values=siglip_in.to(weight_dtype))
+                    image_embed = siglip_out.pooler_output
+                    if image_embed is None:
+                        image_embed = siglip_out.last_hidden_state[:, 0]
+                    image_embed = siglip_proj(image_embed.to(siglip_proj.weight.dtype)).to(prompt_embeds.dtype)
+                    assert image_embed.ndim == 2 and image_embed.shape[0] == prompt_embeds.shape[0], (
+                        f"unexpected image_embed shape: {tuple(image_embed.shape)}"
+                    )
+                    prompt_embeds = prompt_embeds + image_embed.unsqueeze(1)
 
                 # noise + timesteps
                 noise = torch.randn_like(latents)
@@ -701,6 +775,10 @@ def train(args):
 
                 if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                     params_to_clip = list(accelerator.unwrap_model(wrapper).lllite.parameters())
+                    if args.conditioning_type == "image_text":
+                        params_to_clip += list(siglip_proj.parameters())
+                        if args.siglip_trainable:
+                            params_to_clip += [p for p in siglip_vision_model.parameters() if p.requires_grad]
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 optimizer.step()
