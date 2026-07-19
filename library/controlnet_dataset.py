@@ -10,6 +10,7 @@ import os
 from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 
 from library.dataset import (
@@ -229,5 +230,12 @@ class ControlNetDataset(BaseDataset):
             conditioning_images.append(cond_img)
 
         example["conditioning_images"] = torch.stack(conditioning_images).to(memory_format=torch.contiguous_format).float()
+        if example.get("images") is not None:
+            # IP-Adapter joint training consumes the target image twice: this keeps
+            # the original tensor for DiT/VAE target latents and provides a
+            # SigLIP2-ready 512x512 reference tensor for identity tokens.
+            example["siglip_images"] = F.interpolate(
+                example["images"], size=(512, 512), mode="bicubic", align_corners=False
+            ).clamp(-1, 1).to(memory_format=torch.contiguous_format).float()
 
         return example
