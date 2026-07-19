@@ -19,6 +19,8 @@ from PIL import Image
 from tqdm import tqdm
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from library import flux_train_utils, qwen_image_autoencoder_kl
 from library.device_utils import init_ipex, clean_memory_on_device
@@ -66,6 +68,161 @@ setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+SIGLIP_HIDDEN_SIZE = 768
+SIGLIP_IMAGE_SIZE = 512
+
+
+class SigLIPCompressorLayer(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 8):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.norm_self = nn.LayerNorm(dim)
+        self.self_qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.self_out = nn.Linear(dim, dim, bias=False)
+        self.norm_ffn = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+
+    def _heads(self, x: torch.Tensor) -> torch.Tensor:
+        b, s, d = x.shape
+        return x.view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def _unheads(self, x: torch.Tensor) -> torch.Tensor:
+        b, h, s, d = x.shape
+        return x.transpose(1, 2).reshape(b, s, h * d)
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        q_norm = self.norm_q(q)
+        kv_norm = self.norm_kv(kv)
+        q_heads = self._heads(self.q_proj(q_norm))
+        k_heads = self._heads(self.k_proj(kv_norm))
+        v_heads = self._heads(self.v_proj(kv_norm))
+        q = q + self.out_proj(self._unheads(F.scaled_dot_product_attention(q_heads, k_heads, v_heads)))
+        qn = self.norm_self(q)
+        q2, k2, v2 = [self._heads(t) for t in self.self_qkv(qn).chunk(3, dim=-1)]
+        q = q + self.self_out(self._unheads(F.scaled_dot_product_attention(q2, k2, v2)))
+        return q + self.ffn(self.norm_ffn(q))
+
+
+class SigLIPCompressor(nn.Module):
+    def __init__(self, dim: int = SIGLIP_HIDDEN_SIZE, num_queries: int = 64, num_layers: int = 2):
+        super().__init__()
+        self.queries = nn.Parameter(torch.randn(num_queries, dim) * 0.02)
+        self.layers = nn.ModuleList([SigLIPCompressorLayer(dim) for _ in range(num_layers)])
+        self.final_norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        q = self.queries.unsqueeze(0).expand(x.shape[0], -1, -1)
+        for layer in self.layers:
+            q = layer(q, x)
+        return self.final_norm(q)
+
+
+class AnimaIPAdapter(nn.Module):
+    def __init__(self, dit: nn.Module, target_blocks: Optional[str] = None, ip_embed_dim: int = SIGLIP_HIDDEN_SIZE):
+        super().__init__()
+        n_blocks = len(dit.blocks)
+        if target_blocks is None or target_blocks.strip().lower() in {"", "all"}:
+            self.target_blocks = list(range(n_blocks))
+        else:
+            self.target_blocks = [int(x.strip()) for x in target_blocks.split(",") if x.strip()]
+        self.ip_embed_dim = ip_embed_dim
+        self.blocks = nn.ModuleDict()
+        for i in self.target_blocks:
+            block = dit.blocks[i]
+            inner_dim = block.cross_attn.n_heads * block.cross_attn.head_dim
+            mods = nn.ModuleDict({
+                "ip_k_proj": nn.Linear(ip_embed_dim, inner_dim),
+                "ip_v_proj": nn.Linear(ip_embed_dim, inner_dim),
+                "adaln_ip": nn.Sequential(nn.SiLU(), nn.Linear(inner_dim, inner_dim)),
+            })
+            nn.init.normal_(mods["ip_k_proj"].weight, std=1.0 / math.sqrt(ip_embed_dim))
+            nn.init.zeros_(mods["ip_k_proj"].bias)
+            nn.init.normal_(mods["ip_v_proj"].weight, std=1.0 / math.sqrt(ip_embed_dim))
+            nn.init.zeros_(mods["ip_v_proj"].bias)
+            nn.init.zeros_(mods["adaln_ip"][1].weight)
+            nn.init.constant_(mods["adaln_ip"][1].bias, 0.1)
+            self.blocks[str(i)] = mods
+        self.siglip_norm = None
+        self.siglip_compressor = None
+
+    def attach(self, dit: nn.Module, ip_norm_keys: bool = False):
+        for i in self.target_blocks:
+            block = dit.blocks[i]
+            mods = self.blocks[str(i)]
+            block.ip_k_proj = mods["ip_k_proj"]
+            block.ip_v_proj = mods["ip_v_proj"]
+            block.adaln_ip = mods["adaln_ip"]
+            block.use_ip_adapter = True
+            block.ip_norm_keys = ip_norm_keys
+            if ip_norm_keys and not hasattr(block, "ip_k_norm"):
+                block.ip_k_norm = nn.LayerNorm(block.cross_attn.head_dim, elementwise_affine=False, eps=1e-6)
+
+    def saved_state_dict(self, dtype: Optional[torch.dtype] = None) -> dict:
+        out = {}
+        for i in self.target_blocks:
+            for name, tensor in self.blocks[str(i)].state_dict().items():
+                out[f"blocks.{i}.{name}"] = tensor.detach().clone().cpu().to(dtype=dtype) if dtype else tensor.detach().clone().cpu()
+        for attr in ["siglip_norm", "siglip_compressor"]:
+            mod = getattr(self, attr, None)
+            if mod is not None:
+                for k, v in mod.state_dict().items():
+                    out[f"{attr}.{k}"] = v.detach().clone().cpu().to(dtype=dtype) if dtype else v.detach().clone().cpu()
+        return out
+
+
+def _install_ip_forward_hooks(dit: nn.Module, ip_adapter: AnimaIPAdapter):
+    for i in ip_adapter.target_blocks:
+        block = dit.blocks[i]
+        if not getattr(block, "_ip_train_hook_installed", False):
+            def _make_capture(ref):
+                def _hook(_mod, _args):
+                    ref._x_cross_flat = _args[0]
+                return _hook
+            block.cross_attn.register_forward_pre_hook(_make_capture(block))
+            block._ip_train_hook_installed = True
+        if getattr(block, "_ip_train_fwd_patched", False):
+            continue
+        orig_fwd = block.forward
+        def _make_fwd(block_ref, orig):
+            def _patched_forward(x_B_T_H_W_D, emb_B_T_D, crossattn_emb, rope_emb_L_1_1_D=None,
+                                 adaln_lora_B_T_3D=None, extra_per_block_pos_emb=None,
+                                 transformer_options=None, **kwargs):
+                result = orig(x_B_T_H_W_D, emb_B_T_D, crossattn_emb, rope_emb_L_1_1_D=rope_emb_L_1_1_D,
+                              adaln_lora_B_T_3D=adaln_lora_B_T_3D, extra_per_block_pos_emb=extra_per_block_pos_emb,
+                              transformer_options=transformer_options, **kwargs)
+                if transformer_options is None or transformer_options.get("anima_ip_tokens") is None or not hasattr(block_ref, "_x_cross_flat"):
+                    return result
+                ip_tok = transformer_options["anima_ip_tokens"].to(dtype=result.dtype, device=result.device)
+                x_q = block_ref._x_cross_flat
+                b, t, h, w = x_B_T_H_W_D.shape[:4]
+                n_h, h_d = block_ref.cross_attn.n_heads, block_ref.cross_attn.head_dim
+                ip_q = block_ref.cross_attn.q_norm(block_ref.cross_attn.q_proj(x_q).reshape(b, -1, n_h, h_d).permute(0, 2, 1, 3))
+                ip_k = block_ref.ip_k_proj(ip_tok).reshape(b, -1, n_h, h_d).permute(0, 2, 1, 3)
+                ip_v = block_ref.ip_v_proj(ip_tok).reshape(b, -1, n_h, h_d).permute(0, 2, 1, 3)
+                ip_k_norm = getattr(block_ref, "ip_k_norm", None)
+                if ip_k_norm is not None:
+                    ip_k = ip_k_norm(ip_k)
+                ip_attn = F.scaled_dot_product_attention(ip_q, ip_k, ip_v)
+                ip_out = ip_attn.permute(0, 2, 1, 3).reshape(b, t * h * w, n_h * h_d)
+                gate = block_ref.adaln_ip(emb_B_T_D)
+                return result + gate.reshape(b, t, 1, 1, -1) * ip_out.reshape(b, t, h, w, -1)
+            return _patched_forward
+        block.forward = _make_fwd(block, orig_fwd)
+        block._ip_train_fwd_patched = True
+
+
+def _make_siglip_image(images: torch.Tensor) -> torch.Tensor:
+    images = F.interpolate(images, size=(SIGLIP_IMAGE_SIZE, SIGLIP_IMAGE_SIZE), mode="bicubic", align_corners=False)
+    return images.clamp(-1, 1)
 
 
 def _load_control_image(path: str, width: int, height: int, device, dtype) -> torch.Tensor:
@@ -275,6 +432,42 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
             "Only effective when --lllite_cond_in_channels=4. "
             "/ inpainting 時、RGB の mask 域を 0 で穴埋めしてから concat する (cond_in_channels=4 のときのみ有効)"
         ),
+    )
+    parser.add_argument(
+        "--ip_adapter_image_encoder",
+        type=str,
+        default=None,
+        const="google/siglip2-base-patch16-512",
+        nargs="?",
+        help="enable joint IP-Adapter training and load the frozen SigLIP2 vision encoder (default model id when flag is provided without a value)",
+    )
+    parser.add_argument(
+        "--ip_adapter_target_blocks",
+        type=str,
+        default="all",
+        help="comma-separated DiT block indices for IP-Adapter injection, or 'all' (default)",
+    )
+    parser.add_argument(
+        "--ip_adapter_ip_norm_keys",
+        action="store_true",
+        help="instantiate per-block ip_k_norm hooks to match checkpoints trained with normalized IP keys",
+    )
+    parser.add_argument(
+        "--ip_adapter_siglip_norm",
+        action="store_true",
+        help="instantiate frozen siglip_norm LayerNorm before IP projection tokens",
+    )
+    parser.add_argument(
+        "--ip_adapter_siglip_compressor_tokens",
+        type=int,
+        default=0,
+        help="instantiate SigLIP token compressor with this many query tokens (0 disables)",
+    )
+    parser.add_argument(
+        "--ip_adapter_siglip_compressor_layers",
+        type=int,
+        default=2,
+        help="number of SigLIP compressor layers when --ip_adapter_siglip_compressor_tokens is set",
     )
     # --conditioning_data_dir は args_util.add_dataset_arguments 側で既に定義済み
 
@@ -517,11 +710,34 @@ def train(args):
 
     lllite.apply_to()
 
+    ip_adapter = None
+    siglip_encoder = None
+    if args.ip_adapter_image_encoder is not None:
+        logger.info(f"Loading frozen IP-Adapter image encoder: {args.ip_adapter_image_encoder}")
+        from transformers import SiglipVisionModel
+        siglip_encoder = SiglipVisionModel.from_pretrained(args.ip_adapter_image_encoder)
+        siglip_encoder.requires_grad_(False)
+        siglip_encoder.eval()
+        ip_adapter = AnimaIPAdapter(dit, target_blocks=args.ip_adapter_target_blocks)
+        if args.ip_adapter_siglip_norm:
+            ip_adapter.siglip_norm = nn.LayerNorm(SIGLIP_HIDDEN_SIZE, elementwise_affine=True)
+            ip_adapter.siglip_norm.requires_grad_(False)
+        if args.ip_adapter_siglip_compressor_tokens > 0:
+            ip_adapter.siglip_compressor = SigLIPCompressor(
+                dim=SIGLIP_HIDDEN_SIZE,
+                num_queries=args.ip_adapter_siglip_compressor_tokens,
+                num_layers=args.ip_adapter_siglip_compressor_layers,
+            )
+            ip_adapter.siglip_compressor.requires_grad_(False)
+        ip_adapter.attach(dit, ip_norm_keys=args.ip_adapter_ip_norm_keys)
+        _install_ip_forward_hooks(dit, ip_adapter)
+
     wrapper = AnimaControlNetLLLiteWrapper(dit, lllite)
 
     # Optimizer
-    trainable_params = list(lllite.parameters())
-    n_trainable = sum(p.numel() for p in trainable_params if p.requires_grad)
+    trainable_params = list(lllite.parameters()) + (list(ip_adapter.parameters()) if ip_adapter is not None else [])
+    trainable_params = [p for p in trainable_params if p.requires_grad]
+    n_trainable = sum(p.numel() for p in trainable_params)
     accelerator.print(f"number of LLLite modules: {len(lllite.lllite_modules)}")
     accelerator.print(f"number of trainable parameters: {n_trainable:,}")
 
@@ -570,6 +786,12 @@ def train(args):
         lllite_dtype = weight_dtype
     lllite.to(lllite_dtype)
     lllite.to(accelerator.device)
+    if ip_adapter is not None:
+        ip_adapter.to(lllite_dtype)
+        ip_adapter.to(accelerator.device)
+    if siglip_encoder is not None:
+        siglip_encoder.to(accelerator.device, dtype=weight_dtype)
+        siglip_encoder.eval()
 
     if not args.cache_text_encoder_outputs and qwen3_text_encoder is not None:
         qwen3_text_encoder.to(accelerator.device)
@@ -683,7 +905,23 @@ def train(args):
         sai_metadata["lllite.inpaint_masked_input"] = (
             "true" if args.lllite_inpaint_masked_input else "false"
         )
-        save_lllite_model(ckpt_file, unwrapped, dtype=save_dtype, metadata=sai_metadata)
+        if ip_adapter is None:
+            save_lllite_model(ckpt_file, unwrapped, dtype=save_dtype, metadata=sai_metadata)
+            return
+        from safetensors.torch import save_file
+        state_dict = lllite_module._to_saved_state_dict(unwrapped)
+        state_dict.update(ip_adapter.saved_state_dict(dtype=save_dtype))
+        state_dict = {k: v.detach().clone().cpu().to(dtype=save_dtype) for k, v in state_dict.items()}
+        sai_metadata["modelspec.architecture"] = "anima-preview/control-net-lllite-ip-adapter"
+        sai_metadata["ip_adapter.image_encoder"] = args.ip_adapter_image_encoder
+        sai_metadata["ip_adapter.target_blocks"] = ",".join(str(i) for i in ip_adapter.target_blocks)
+        sai_metadata["ip_norm_keys"] = "true" if args.ip_adapter_ip_norm_keys else "false"
+        sai_metadata["siglip_norm"] = "true" if ip_adapter.siglip_norm is not None else "false"
+        sai_metadata["siglip_compressor"] = "true" if ip_adapter.siglip_compressor is not None else "false"
+        if os.path.splitext(ckpt_file)[1] == ".safetensors":
+            save_file(state_dict, ckpt_file, sai_metadata)
+        else:
+            torch.save(state_dict, ckpt_file)
 
     def _save_step(global_step_: int, epoch_: int):
         accelerator.wait_for_everyone()
@@ -788,6 +1026,25 @@ def train(args):
                 # cond image: dataset 側で IMAGE_TRANSFORMS により [-1,1] 正規化済み
                 cond_image = batch["conditioning_images"].to(accelerator.device, dtype=dit_weight_dtype)
 
+                # IP-Adapter reference path: the same target image is consumed a second time,
+                # formatted for SigLIP2, while latents above remain the DiT loss target.
+                transformer_options = None
+                if siglip_encoder is not None:
+                    siglip_images = batch.get("siglip_images", None)
+                    if siglip_images is None:
+                        siglip_images = _make_siglip_image(batch["images"].to(accelerator.device, dtype=weight_dtype))
+                    else:
+                        siglip_images = siglip_images.to(accelerator.device, dtype=weight_dtype)
+                    with torch.no_grad(), accelerator.autocast():
+                        siglip_outputs = siglip_encoder(siglip_images, output_hidden_states=True)
+                        ip_tokens = siglip_outputs.last_hidden_state
+                    ip_tokens = ip_tokens.to(accelerator.device, dtype=lllite_dtype)
+                    if ip_adapter.siglip_norm is not None:
+                        ip_tokens = ip_adapter.siglip_norm(ip_tokens)
+                    if ip_adapter.siglip_compressor is not None:
+                        ip_tokens = ip_adapter.siglip_compressor(ip_tokens)
+                    transformer_options = {"anima_ip_tokens": ip_tokens}
+
                 # inpainting: ランダム mask をバッチ毎に生成し、cond_image を 4ch (RGB + mask) 化
                 if is_inpaint:
                     bs_c, _, h_c, w_c = cond_image.shape
@@ -811,6 +1068,7 @@ def train(args):
                         source_attention_mask=attn_mask,
                         t5_input_ids=t5_input_ids,
                         t5_attn_mask=t5_attn_mask,
+                        transformer_options=transformer_options,
                     )
                 model_pred = model_pred.squeeze(2)
 
@@ -848,7 +1106,7 @@ def train(args):
                     raise
 
                 if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                    params_to_clip = list(accelerator.unwrap_model(wrapper).lllite.parameters())
+                    params_to_clip = trainable_params
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 optimizer.step()
